@@ -1,4 +1,16 @@
 {
+  "name": "council-of-intelligence-networks",
+  "version": "1.0.0",
+  "description": "Real-time Multi-Agent LLM Orchestration Engine with Borda Count Voting and Dynamic Chairman Selection",
+  "private": true,
+  "scripts": {
+    "dev:client": "cd client && npm run dev",
+    "dev:server": "cd server && npm run dev",
+    "build:client": "cd client && npm run build",
+    "start:server": "cd server && npm start",
+    "benchmark": "node run_benchmark.js",
+    "test:latency": "node test_latency.js"
+  },
   "dependencies": {
     "groq-sdk": "^0.37.0"
   }

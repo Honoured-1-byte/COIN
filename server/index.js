@@ -1,127 +1,213 @@
 // Server Entry Point - Dependencies Verified
+// Import the express module to create the web server
 import express from 'express';
+// Import the cors module to enable Cross-Origin Resource Sharing
 import cors from 'cors';
+// Import the dotenv module to load environment variables from a .env file
 import dotenv from 'dotenv';
+// Import the Groq SDK to interact with Groq's LLM API
 import Groq from 'groq-sdk';
+// Import mongoose to interact with the MongoDB database
 import mongoose from 'mongoose';
+// Import bcryptjs for securely hashing and verifying passwords
 import bcrypt from 'bcryptjs';
+// Import jsonwebtoken for creating and verifying JWTs for authentication
 import jwt from 'jsonwebtoken';
+// Import the native crypto module for encryption and decryption tasks
 import crypto from 'crypto';
 
+// Import cookie-parser to parse HTTP request cookies (specifically for the API key vault)
 import cookieParser from 'cookie-parser';
 
+// Import express-rate-limit to protect API routes from spam and abuse
 import rateLimit from 'express-rate-limit';
 
+// Execute the dotenv config function to populate process.env
 dotenv.config();
+// Initialize the express application instance
 const app = express();
 
+// Use the cors middleware on the app
 app.use(cors({
+  // Specify the allowed origin (the frontend Vite development server)
   origin: 'http://localhost:5173', // Vite default port
+  // Allow credentials (like cookies and authorization headers) to be sent across origins
   credentials: true // Allow cookies
 }));
+// Use the express.json middleware to parse incoming JSON payloads, with a high limit for base64 images
 app.use(express.json({ limit: '10mb' }));
+// Use the cookie-parser middleware to make req.cookies accessible
 app.use(cookieParser());
 
 // --- RATE LIMITING (Protect Wallet) ---
+// Define a general rate limiter for the API
 const apiLimiter = rateLimit({
+  // Set the time window to 15 minutes (in milliseconds)
   windowMs: 15 * 60 * 1000, // 15 minutes
+  // Allow a maximum of 100 requests per IP address per window
   max: 100, // Limit each IP to 100 requests per window
+  // Define the error message sent when the limit is exceeded
   message: "Too many requests from this IP, please try again later.",
+  // Enable standard rate limit headers (RateLimit-Limit, RateLimit-Remaining, etc.)
   standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
+  // Disable legacy rate limit headers (X-RateLimit-*)
   legacyHeaders: false, // Disable the `X-RateLimit-*` headers
 });
 
 // Apply strict limit to expensive AI endpoints
 // Allow slightly more for streaming as it might have retries
+// Define a stricter rate limiter for heavy/expensive API endpoints
 const heavyLimiter = rateLimit({
+  // Set the time window to 1 hour (in milliseconds)
   windowMs: 60 * 60 * 1000, // 1 hour
+  // Allow a maximum of 50 requests per IP address per window
   max: 50, // 50 Councils per hour per user is plenty
+  // Define the error message sent when the heavy limit is exceeded
   message: "Council Session Limit Reached. Please take a break.",
 });
 
+// Apply the general apiLimiter to all routes starting with /api/
 app.use('/api/', apiLimiter); // General limit for all API routes
+// Apply the heavyLimiter specifically to the /api/round-2 endpoint
 app.use('/api/round-2', heavyLimiter);
+// Apply the heavyLimiter specifically to the /api/stream-round-1 endpoint
 app.use('/api/stream-round-1', heavyLimiter);
 
 // --- 1. CONFIGURATION & SECRETS ---
+// Define the secret key used to sign JWTs, falling back to a default if not in env
 const JWT_SECRET = process.env.JWT_SECRET || "council_top_secret_key_change_me";
+// Define the master secret used for encrypting user API keys, falling back to a default
 const ENCRYPTION_SECRET = process.env.ENCRYPTION_SECRET || "council_master_encryption_secret_change_me";
+// Define the standard Initialization Vector (IV) length for AES-256-CBC (16 bytes)
 const IV_LENGTH = 16;
 
 // --- 1.5. ENCRYPTION HELPERS (User-Specific) ---
+// Define a function to encrypt text (like an API key) tied to a specific user ID
 function encrypt(text, userId) {
+  // If the text or user ID is missing, return null early
   if (!text || !userId) return null;
+  // Generate a random 16-byte salt for cryptographic stretching
   const salt = crypto.randomBytes(16);
+  // Derive a 32-byte key using scrypt, combining the master secret, userId, and the random salt
   const key = crypto.scryptSync(ENCRYPTION_SECRET + userId, salt, 32);
+  // Generate a random 16-byte Initialization Vector (IV)
   const iv = crypto.randomBytes(IV_LENGTH);
+  // Create a Cipher instance using the aes-256-cbc algorithm, the derived key, and the IV
   const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
+  // Encrypt the input text
   let encrypted = cipher.update(text);
+  // Finalize the encryption process and concatenate the final block
   encrypted = Buffer.concat([encrypted, cipher.final()]);
+  // Return the salt, IV, and encrypted text formatted as a single hex string separated by colons
   return salt.toString('hex') + ':' + iv.toString('hex') + ':' + encrypted.toString('hex');
 }
 
+// Define a function to decrypt the previously encrypted text
 function decrypt(text, userId) {
+  // If the text or user ID is missing, return null early
   if (!text || !userId) return null;
+  // Split the encrypted string by colons to extract its components
   const textParts = text.split(':');
+  // If the string doesn't have exactly 3 parts (salt, iv, cipher), it's invalid, return null
   if (textParts.length !== 3) return null;
+  // Convert the first part (hex string) back into a Buffer representing the salt
   const salt = Buffer.from(textParts.shift(), 'hex');
+  // Convert the next part (hex string) back into a Buffer representing the IV
   const iv = Buffer.from(textParts.shift(), 'hex');
+  // Convert the remaining part (hex string) back into a Buffer representing the encrypted data
   const encryptedText = Buffer.from(textParts.join(':'), 'hex');
+  // Re-derive the exact same 32-byte key using scrypt, the master secret, userId, and the extracted salt
   const key = crypto.scryptSync(ENCRYPTION_SECRET + userId, salt, 32);
+  // Create a Decipher instance using the aes-256-cbc algorithm, the derived key, and the extracted IV
   const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
+  // Decrypt the encrypted data
   let decrypted = decipher.update(encryptedText);
+  // Finalize the decryption process and concatenate the final block
   decrypted = Buffer.concat([decrypted, decipher.final()]);
+  // Convert the decrypted Buffer back into a UTF-8 string and return it
   return decrypted.toString();
 }
 
 // Middleware: Extract & Decrypt API Key
 // MUST run AFTER authenticateToken so req.user.userId is available
+// Define an Express middleware function to attach the decrypted Groq API key to the request
 const attachApiKey = (req, res, next) => {
+  // Start a try-catch block to handle unexpected errors during extraction
   try {
+    // Attempt to read the 'groq_vault' cookie; if present, decode it, otherwise set to null
     const encryptedKey = req.cookies.groq_vault
       ? decodeURIComponent(req.cookies.groq_vault)
       : null;
 
+    // If an encrypted key exists and the user is authenticated (req.user.userId exists)
     if (encryptedKey && req.user && req.user.userId) {
+      // Try to decrypt the key
       try {
+        // Call the decrypt function and attach the plaintext key to the req object
         req.userApiKey = decrypt(encryptedKey, req.user.userId);
+      // Catch any errors specifically related to decryption (e.g., wrong secret, tampered cookie)
       } catch (decryptionErr) {
+        // Log a warning indicating the cookie was invalid or couldn't be decrypted
         console.warn("[Auth Warning] Invalid/Old Cookie found. Clearing it.");
+        // Clear the corrupted 'groq_vault' cookie from the user's browser
         res.clearCookie('groq_vault');
+        // Explicitly set the attached key to null
         req.userApiKey = null;
       }
     }
+  // Catch broader errors outside of the decryption logic
   } catch (err) {
+    // Log the error message
     console.error("Key Handler Error:", err.message);
   }
+  // Call next() to pass control to the next middleware or route handler
   next();
 };
 
 // --- 2. DATABASE CONNECTION ---
+// Initiate a connection to MongoDB using the URI from environment variables
 mongoose.connect(process.env.MONGO_URI)
+  // If the connection is successful, log a confirmation message
   .then(() => console.log("✅ MongoDB Connected"))
+  // If the connection fails, log the error
   .catch(err => console.error("❌ MongoDB Connection Error:", err));
 
 // --- 3. SCHEMAS ---
+// Define a Mongoose schema for the User collection
 const UserSchema = new mongoose.Schema({
+  // The user's email must be a string, is required, and must be unique in the database
   email: { type: String, required: true, unique: true },
+  // The user's hashed password must be a string and is required
   password: { type: String, required: true },
+  // The creation timestamp defaults to the current date/time
   createdAt: { type: Date, default: Date.now }
 });
 
+// Define a Mongoose schema for the Session (chat history) collection
 const SessionSchema = new mongoose.Schema({
+  // The ID of the user who owns this session, required
   userId: { type: String, required: true }, // LINKED TO USER
+  // The original prompt provided by the user, required
   prompt: { type: String, required: true },
+  // The classified category of the prompt, defaults to 'GENERAL'
   category: { type: String, default: "GENERAL" },
+  // The round number (usually 2, indicating completion), required
   round: { type: Number, required: true },
+  // An array of flexible mixed types to store the raw reports from all agents
   reports: [mongoose.Schema.Types.Mixed],
+  // An array of flexible mixed types to store the voting/ranking results
   votes: [mongoose.Schema.Types.Mixed],
+  // A mixed field to store complex result data (like math calculations)
   math_result: mongoose.Schema.Types.Mixed,
+  // The final synthesized verdict generated by the Chairman
   verdict: String,
+  // The timestamp for when the session was created, defaults to current time
   timestamp: { type: Date, default: Date.now }
 });
 
+// Compile the UserSchema into a Mongoose Model named 'User'
 const User = mongoose.model('User', UserSchema);
+// Compile the SessionSchema into a Mongoose Model named 'Session'
 const Session = mongoose.model('Session', SessionSchema);
 
 // --- 4. COUNCIL CONFIGURATION (GOD MODE) ---
@@ -202,6 +288,101 @@ const councilConfig = [
   }
 ];
 
+// --- 4.5. CONCURRENCY & MEMORY OVERHAUL HELPERS ---
+class RequestQueue {
+  constructor() {
+    this.queue = [];
+    this.activeCount = 0;
+    this.concurrencyLimit = 2;
+    this.onEmpty = null;
+  }
+
+  enqueue(task) {
+    return new Promise((resolve, reject) => {
+      this.queue.push(async () => {
+        try {
+          const result = await task();
+          resolve(result);
+        } catch (error) {
+          reject(error);
+        } finally {
+          this.activeCount--;
+          this.processNext();
+        }
+      });
+      this.processNext();
+    });
+  }
+
+  processNext() {
+    if (this.activeCount < this.concurrencyLimit && this.queue.length > 0) {
+      const nextTask = this.queue.shift();
+      if (nextTask) {
+        this.activeCount++;
+        nextTask();
+      }
+    } else if (this.activeCount === 0 && this.queue.length === 0) {
+      if (this.onEmpty) this.onEmpty();
+    }
+  }
+
+  get isIdle() {
+    return this.activeCount === 0 && this.queue.length === 0;
+  }
+}
+
+class QueueManager {
+  constructor() {
+    this.queues = new Map();
+    this.cleanupTimers = new Map();
+    this.TTL_MS = 60000;
+  }
+
+  getQueue(apiKey) {
+    if (this.cleanupTimers.has(apiKey)) {
+      clearTimeout(this.cleanupTimers.get(apiKey));
+      this.cleanupTimers.delete(apiKey);
+    }
+
+    if (!this.queues.has(apiKey)) {
+      const newQueue = new RequestQueue();
+      newQueue.onEmpty = () => {
+        const timer = setTimeout(() => {
+          if (newQueue.isIdle) {
+            this.queues.delete(apiKey);
+            this.cleanupTimers.delete(apiKey);
+          }
+        }, this.TTL_MS);
+        this.cleanupTimers.set(apiKey, timer);
+      };
+      this.queues.set(apiKey, newQueue);
+    }
+    return this.queues.get(apiKey);
+  }
+}
+
+const globalQueueManager = new QueueManager();
+
+const withExponentialBackoff = async (apiCall, maxRetries = 3, baseDelay = 1000, multiplier = 2) => {
+  let attempt = 0;
+  while (attempt <= maxRetries) {
+    try {
+      return await apiCall();
+    } catch (error) {
+      const isRateLimit = error?.status === 429;
+      const isTimeout = error?.code === 'ETIMEDOUT' || error?.code === 'ECONNABORTED';
+      if ((!isRateLimit && !isTimeout) || attempt === maxRetries) {
+        throw error;
+      }
+      const delay = baseDelay * Math.pow(multiplier, attempt);
+      const jitter = Math.random() * 200; 
+      await new Promise(resolve => setTimeout(resolve, delay + jitter));
+      attempt++;
+    }
+  }
+  throw new Error("API call failed after max retries.");
+};
+
 // --- 5. HELPER FUNCTIONS ---
 
 // MIDDLEWARE: The Gatekeeper
@@ -218,10 +399,9 @@ const authenticateToken = (req, res, next) => {
   });
 };
 
-async function classifyPrompt(apiKey, prompt) {
-  const groq = new Groq({ apiKey });
+async function classifyPrompt(apiClient, prompt) {
   try {
-    const completion = await groq.chat.completions.create({
+    const completion = await apiClient.chat.completions.create({
       messages: [{
         role: "system",
         content: `Classify this prompt into exactly one category: MATH, CODING, CREATIVE, AUDIT, SUMMARY, or GENERAL. Return ONLY the word.`
@@ -249,8 +429,7 @@ function getChairmanModel(category) {
 }
 
 // --- UPDATED HELPER: callGroq (With Strict Timeout) ---
-async function callGroq(apiKey, primaryModel, backupModel, systemPrompt, userPrompt, base64Image = null, params = {}) {
-  const groq = new Groq({ apiKey: apiKey });
+async function callGroq(apiClient, primaryModel, backupModel, systemPrompt, userPrompt, base64Image = null, params = {}) {
   const TIMEOUT_MS = 15000; // 15 Seconds strict timeout
 
   const executeRun = async (targetModel) => {
@@ -273,12 +452,12 @@ async function callGroq(apiKey, primaryModel, backupModel, systemPrompt, userPro
       console.log(`[Attempting] ${targetModel}...`);
 
       // 1. Define the API Call
-      const apiPromise = groq.chat.completions.create({
+      const apiPromise = withExponentialBackoff(() => apiClient.chat.completions.create({
         messages,
         model: targetModel,
         temperature: params.temperature || 0.6,
         max_tokens: params.max_tokens || 2048
-      });
+      }));
 
       // 2. Define the Timeout
       const timeoutPromise = new Promise((_, reject) =>
@@ -385,7 +564,11 @@ app.post('/api/stream-round-1', authenticateToken, attachApiKey, async (req, res
   if (!user_prompt) return res.status(400).json({ error: "Invalid prompt path" });
 
   res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
-  const groq = new Groq({ apiKey: key });
+  
+  if (!req.apiClient) {
+    req.apiClient = new Groq({ apiKey: key });
+  }
+  const queue = globalQueueManager.getQueue(key);
 
   const streamAgent = async (member) => {
     try {
@@ -403,7 +586,7 @@ app.post('/api/stream-round-1', authenticateToken, attachApiKey, async (req, res
         messages = [{ role: "system", content: member.prompt }, { role: "user", content: content }];
       }
 
-      const stream = await groq.chat.completions.create({ messages, model: effectiveModel, temperature: member.params.temperature, max_tokens: 2048, stream: true });
+      const stream = await withExponentialBackoff(() => req.apiClient.chat.completions.create({ messages, model: effectiveModel, temperature: member.params.temperature, max_tokens: 2048, stream: true }));
       for await (const chunk of stream) {
         const content = chunk.choices[0]?.delta?.content || "";
         if (content) res.write(`data: ${JSON.stringify({ id: member.id, chunk: content })}\n\n`);
@@ -411,19 +594,8 @@ app.post('/api/stream-round-1', authenticateToken, attachApiKey, async (req, res
     } catch (error) { res.write(`data: ${JSON.stringify({ id: member.id, chunk: `\n\n**[ERROR: ${error.message}]**` })}\n\n`); }
   };
 
-  // --- NEW: BATCH EXECUTION (The Scalability Shield) ---
-  const BATCH_SIZE = 1;
-  for (let i = 0; i < councilConfig.length; i += BATCH_SIZE) {
-    const batch = councilConfig.slice(i, i + BATCH_SIZE);
-
-    // Run batch in parallel (but now it's size 1, so sequential)
-    await Promise.all(batch.map(agent => streamAgent(agent)));
-
-    // Optional: Add small delay between batches to be ultra-safe
-    if (i + BATCH_SIZE < councilConfig.length) {
-      await new Promise(resolve => setTimeout(resolve, 500));
-    }
-  }
+  // Push all agents into the KeyedQueueManager
+  await Promise.all(councilConfig.map(agent => queue.enqueue(() => streamAgent(agent))));
 
   res.write('data: [DONE]\n\n');
   res.end();
@@ -442,9 +614,14 @@ app.post('/api/round-2', authenticateToken, attachApiKey, async (req, res) => {
 
   if (!key) return res.status(400).json({ error: "Missing API Key" });
 
+  if (!req.apiClient) {
+    req.apiClient = new Groq({ apiKey: key });
+  }
+  const queue = globalQueueManager.getQueue(key);
+
   try {
     // 1. Initial Router Classification (based on user prompt "can u solve this")
-    let category = await classifyPrompt(key, user_prompt);
+    let category = await classifyPrompt(req.apiClient, user_prompt);
     console.log(`[Round 2] Initial Category: ${category}`);
 
     // 2. THE OCR RELAY (The Fix)
@@ -480,21 +657,14 @@ app.post('/api/round-2', authenticateToken, attachApiKey, async (req, res) => {
       Return ONLY valid JSON in this format: { "rank": [1, 3, 2, 5, 4], "reason": "Choice 1 was most accurate..." }
       `;
 
-      return callGroq(key, "llama-3.1-8b-instant", "openai/gpt-oss-20b", "You are a specific Judge. Output strictly JSON.", rankingPrompt, null, { temperature: 0.1 })
+      return callGroq(req.apiClient, "llama-3.1-8b-instant", "openai/gpt-oss-20b", "You are a specific Judge. Output strictly JSON.", rankingPrompt, null, { temperature: 0.1 })
         .then(content => ({ judge_id: member.id, raw_response: content, parsed_review: cleanReviewJSON(content) }))
         .catch(err => ({ judge_id: member.id, error: err.message, parsed_review: null }));
     };
 
-    for (let i = 0; i < councilConfig.length; i += BATCH_SIZE) {
-      const batch = councilConfig.slice(i, i + BATCH_SIZE);
-      const batchResults = await Promise.all(batch.map(member => judgeAgent(member)));
-      peerRankings.push(...batchResults);
-
-      // Delay to respect rate limits
-      if (i + BATCH_SIZE < councilConfig.length) {
-        await new Promise(r => setTimeout(r, 1000));
-      }
-    }
+    // Push all judges into the KeyedQueueManager
+    const batchResults = await Promise.all(councilConfig.map(member => queue.enqueue(() => judgeAgent(member))));
+    peerRankings.push(...batchResults);
 
     const mathResult = calculateWinner(peerRankings, 5);
     const top3Ids = mathResult.top_3_ids;
@@ -537,7 +707,7 @@ app.post('/api/round-2', authenticateToken, attachApiKey, async (req, res) => {
     // Use Llama-8B as the "Guaranteed Delivery" backup.
     // NOTE: This callGroq will now return the "DISMISSED" message if it fully fails, effectively unblocking the UI.
     let finalVerdict = await callGroq(
-      key,
+      req.apiClient,
       chairmanModel,
       "llama-3.1-8b-instant",
       systemInstruction,
