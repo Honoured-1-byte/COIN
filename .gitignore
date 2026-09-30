@@ -20,6 +20,11 @@ server/history.json
 evaluation/
 *.log
 
+# One-off AI code-commenting utilities
+/auto_commenter.js
+/server/auto_commenter.js
+/server/auto_commenter.cjs
+
 # OS Metadata
 .DS_Store
 Thumbs.db

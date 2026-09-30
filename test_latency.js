@@ -1,110 +1,137 @@
-// Import the built-in Node.js file system module for file operations (not used in this script but standard to include)
-const fs = require('fs');
-// Import and configure dotenv to load environment variables from the server/.env file, resolving the path relative to the current directory
-require('dotenv').config({ path: require('path').resolve(__dirname, 'server/.env') });
+// Load API credentials and optional test settings from server/.env.
+const path = require('path');
+const { createRequire } = require('module');
+const serverRequire = createRequire(path.join(__dirname, 'server', 'package.json'));
+serverRequire('dotenv').config({ path: path.resolve(__dirname, 'server/.env') });
 
-// Define the base URL of the local API server
-const API_URL = 'http://localhost:8000';
-// Define the email address to be used for authentication
-const EMAIL = 'admin@coin.com';
-// Define the password to be used for authentication
-const PASSWORD = 'password123';
-// Retrieve the Groq API key from the loaded environment variables
+const API_URL = process.env.LATENCY_API_URL || 'http://localhost:8000';
+const EMAIL = process.env.LATENCY_TEST_EMAIL || 'admin@coin.com';
+const PASSWORD = process.env.LATENCY_TEST_PASSWORD || 'password123';
 const GROQ_KEY = process.env.groq_api_key;
+const RUNS = Math.max(1, Number.parseInt(process.env.LATENCY_TEST_RUNS || '10', 10));
+const GAP_MS = Math.max(0, Number.parseInt(process.env.LATENCY_TEST_GAP_MS || '60000', 10));
 
-// Asynchronous function to authenticate and get a JWT token
+function sleep(milliseconds) {
+    return new Promise(resolve => setTimeout(resolve, milliseconds));
+}
+
+function percentile(values, fraction) {
+    const sorted = [...values].sort((a, b) => a - b);
+    const position = (sorted.length - 1) * fraction;
+    const lower = Math.floor(position);
+    const upper = Math.ceil(position);
+    return sorted[lower] + (sorted[upper] - sorted[lower]) * (position - lower);
+}
+
+function summarize(label, values) {
+    if (!values.length) {
+        console.log(`${label}: no successful samples`);
+        return;
+    }
+    console.log(`${label}: p50 = ${percentile(values, 0.50).toFixed(1)}ms, p95 = ${percentile(values, 0.95).toFixed(1)}ms`);
+}
+
 async function login() {
-    // Send a POST request to the /api/login endpoint
     const res = await fetch(`${API_URL}/api/login`, {
-        // Specify the HTTP method as POST
         method: 'POST',
-        // Set the request headers to indicate the body is JSON
         headers: { 'Content-Type': 'application/json' },
-        // Convert the email and password object into a JSON string for the request body
         body: JSON.stringify({ email: EMAIL, password: PASSWORD })
     });
-    // Parse the JSON response body from the server
+
+    if (!res.ok) {
+        throw new Error(`Login failed with HTTP ${res.status}: ${await res.text()}`);
+    }
     const data = await res.json();
-    // Return the authentication token from the parsed data
+    if (!data.token) throw new Error('Login response did not include a token');
     return data.token;
 }
 
-// Asynchronous function to measure Time To First Token (TTFT) and total response time
 async function measureTTFT(token, prompt) {
-    // Record the current timestamp as the start time of the request
     const startTime = Date.now();
-    // Initialize a variable to track the time the first token is received
     let firstTokenTime = null;
 
-    // Send a POST request to the /api/stream-round-1 endpoint
     const response = await fetch(`${API_URL}/api/stream-round-1`, {
-        // Specify the HTTP method as POST
         method: 'POST',
-        // Set the request headers
         headers: {
-            // Indicate the body is JSON
             'Content-Type': 'application/json',
-            // Provide the JWT token in the Authorization header for access control
             'Authorization': `Bearer ${token}`
         },
-        // Convert the user prompt and Groq key into a JSON string for the request body
-        body: JSON.stringify({ user_prompt: prompt, groq_key: GROQ_KEY })
+        body: JSON.stringify({ user_prompt: prompt, groq_key: GROQ_KEY }),
+        signal: AbortSignal.timeout(120000)
     });
 
-    // Obtain a reader from the response body to stream the incoming data chunks
-    const reader = response.body.getReader();
-    // Initialize a TextDecoder to convert the raw binary chunks into strings
-    const decoder = new TextDecoder();
+    if (!response.ok) {
+        const error = new Error(`Latency request failed with HTTP ${response.status}: ${await response.text()}`);
+        error.status = response.status;
+        throw error;
+    }
+    if (!response.body) throw new Error('Latency response did not include a stream');
 
-    // Start an infinite loop to process the stream
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let streamText = '';
+
     while (true) {
-        // Read the next chunk from the stream; 'done' indicates completion, 'value' contains the data
         const { done, value } = await reader.read();
-        // Check if this is the first chunk received
-        if (firstTokenTime === null) {
-            // Record the current timestamp as the Time To First Token
-            firstTokenTime = Date.now();
+        if (value && value.length > 0) {
+            if (firstTokenTime === null) {
+                firstTokenTime = Date.now();
+            }
+            streamText += decoder.decode(value, { stream: true });
         }
-        // If the stream is finished, break out of the infinite loop
         if (done) break;
     }
-    
-    // Record the current timestamp as the end time of the request
+
+    if (/\[ERROR:.*(?:429|rate.?limit|too many requests)/is.test(streamText)) {
+        const error = new Error('Groq rate limit detected in the streamed response; stopping to avoid additional requests');
+        error.status = 429;
+        throw error;
+    }
+    if (firstTokenTime === null) {
+        throw new Error('The stream completed without returning any data');
+    }
+
     const endTime = Date.now();
-    // Return an object containing the latency metrics
     return {
-        // Calculate the TTFT by subtracting the start time from the first token time
         ttft: firstTokenTime - startTime,
-        // Calculate the total time by subtracting the start time from the end time
         totalTime: endTime - startTime
     };
 }
 
-// Immediately Invoked Function Expression (IIFE) to run the main logic asynchronously
 (async () => {
-    // Start a try-catch block to handle any errors during execution
+    const results = [];
     try {
-        // Log a message indicating that the login process is starting
-        console.log("Logging in...");
-        // Call the login function and await the token
-        const token = await login();
-        // Log a success message indicating the token was obtained and tests are starting
-        console.log("Token obtained. Running 3 TTFT tests...");
+        if (!GROQ_KEY) throw new Error('Missing groq_api_key in server/.env');
 
-        // Start a loop to run the test 3 times
-        for(let i=1; i<=3; i++) {
-            // Call the measureTTFT function with the token and a test prompt, and await the results
-            const res = await measureTTFT(token, `Test prompt ${i}: Please explain quantum mechanics in exactly 20 words.`);
-            // Log the results for the current test iteration, including TTFT and total time
-            console.log(`Test ${i}: TTFT = ${res.ttft}ms, Total Time = ${res.totalTime}ms`);
-            // Wait for 2000 milliseconds (2 seconds) before running the next test iteration to avoid rate limiting
-            await new Promise(r => setTimeout(r, 2000));
+        console.log(`Logging in to ${API_URL}...`);
+        const token = await login();
+        console.log(`Running ${RUNS} sequential TTFT tests with ${GAP_MS}ms between requests.`);
+
+        for (let run = 1; run <= RUNS; run++) {
+            try {
+                const result = await measureTTFT(token, `Latency sample ${run}: Reply with one short sentence.`);
+                results.push(result);
+                console.log(`Test ${run}/${RUNS}: TTFT = ${result.ttft}ms, Total Time = ${result.totalTime}ms`);
+            } catch (error) {
+                console.error(`Test ${run}/${RUNS} failed: ${error.message}`);
+                if (error.status === 429) {
+                    console.error('Stopping the run after a rate limit response.');
+                    break;
+                }
+                throw error;
+            }
+
+            if (run < RUNS) {
+                console.log(`Waiting ${GAP_MS}ms before the next sample...`);
+                await sleep(GAP_MS);
+            }
         }
 
-    // Catch any errors that occurred in the try block
-    } catch (err) {
-        // Log the error message to the console
-        console.error("Test failed:", err);
+        console.log(`\nCompleted ${results.length}/${RUNS} samples.`);
+        summarize('TTFT', results.map(result => result.ttft));
+        summarize('Total time', results.map(result => result.totalTime));
+    } catch (error) {
+        console.error('Latency test stopped:', error.message);
+        process.exitCode = 1;
     }
-// Execute the IIFE
 })();
